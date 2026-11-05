@@ -61,21 +61,27 @@
   </form>
 
   <section id="app" hidden>
-    <h1>받을 수 있는 파일</h1>
     <div class="sub" id="sub"></div>
     <div class="bar">
-      <input id="q" type="search" placeholder="제목 검색 (띄어 쓴 낱말은 모두 들어간 것)">
+      <input id="q" type="search" placeholder="이름 검색 (띄어 쓴 낱말은 모두 들어간 것)">
+      <select id="src">
+        <option value="">출처 전체</option>
+        <option value="cw">cw</option>
+        <option value="ntk">ntk</option>
+        <option value="own">가진 것</option>
+      </select>
       <select id="board"><option value="">분류 전체</option></select>
       <select id="status"><option value="">완결 여부 전체</option></select>
       <select id="sort">
-        <option value="new">최신순</option>
+        <option value="base">기본 순</option>
+        <option value="name">이름 순</option>
         <option value="cheap">포인트 낮은 순</option>
         <option value="soon">마감 가까운 순</option>
       </select>
       <button id="logout" type="button" title="기억한 비밀번호를 지운다">잠그기</button>
     </div>
     <table>
-      <thead><tr><th>제목</th><th>분류</th><th>완결</th><th class="num">포인트</th><th class="num">남은 시간</th></tr></thead>
+      <thead><tr><th>이름</th><th>분류</th><th>완결</th><th class="num">포인트</th><th class="num">남은 시간</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
     <button id="more" type="button" hidden>더 보기</button>
@@ -83,8 +89,10 @@
 </main>
 <script>
 (() => {
-  const DATA_URL = "list.enc.json";
+  // index.json: 조각 순서·salt. data/*.json: 전체본(base-…) + 변경분(d-…) — 차례로 풀어 합친다
+  const INDEX_URL = "index.json";
   const PAGE = 300;
+  const UNIT = { cw: "cp", ntk: "np" };
   const $ = (id) => document.getElementById(id);
   const b64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
   const store = {
@@ -93,8 +101,10 @@
     del(k) { try { localStorage.removeItem(k); } catch {} },
   };
 
-  let envelope = null;
+  let envelope = null; // index.json
+  let sealed = null;   // 조각들 (받아만 두고 비밀번호를 받으면 푼다)
   let items = [];
+  let counts = {};
   let shown = 0;
   let view = [];
 
@@ -105,22 +115,36 @@
       base, { name: "AES-GCM", length: 256 }, true, ["decrypt"]);
   }
 
-  async function decrypt(key) {
-    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64(envelope.iv) }, key, b64(envelope.ct));
+  async function openChunk(key, chunk) {
+    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64(chunk.iv) }, key, b64(chunk.ct));
     const stream = new Blob([plain]).stream().pipeThrough(new DecompressionStream("gzip"));
     return JSON.parse(await new Response(stream).text());
   }
 
+  async function decrypt(key) {
+    const parts = await Promise.all((await sealed).map((c) => openChunk(key, c)));
+    const rows = new Map();
+    counts = parts[parts.length - 1]?.counts || {};
+    for (const part of parts) {
+      for (const k of part.del) rows.delete(k);
+      for (const [k, ...r] of part.set) rows.set(k, r);
+    }
+    return rows;
+  }
+
   const keyName = () => "filelist-key:" + envelope.salt;
 
-  async function open(data) {
-    const f = data.fields;
-    const at = (name) => f.indexOf(name);
-    const [ti, bi, si, ci, di] = ["title", "board", "status", "cost", "due"].map(at);
-    items = data.rows.map((r) => ({ title: r[ti], board: r[bi], status: r[si], cost: r[ci], due: r[di], key: norm(r[ti]) }));
-    $("sub").textContent = `${new Date(data.updated).toLocaleString("ko-KR")} 기준 · ${items.length.toLocaleString()}건`;
+  async function open(rows) {
+    items = [];
+    let order = 0;
+    for (const [src, name, board, status, cost, due] of rows.values()) {
+      items.push({ src, name, board: board || "모름", status: status || "모름", cost, due, order: order++, key: norm(name) });
+    }
+    const c = counts;
+    $("sub").textContent = `${new Date(envelope.updated).toLocaleString("ko-KR")} 기준 · ` +
+      `cw ${(c.cw || 0).toLocaleString()} · ntk ${(c.ntk || 0).toLocaleString()} · 가진 것 ${(c.own || 0).toLocaleString()}`;
     fill($("board"), items.map((x) => x.board));
-    fill($("status"), items.map((x) => x.status || "모름"));
+    fill($("status"), items.map((x) => x.status));
     $("lock").hidden = true;
     $("app").hidden = false;
     render();
@@ -133,7 +157,7 @@
     for (const [v, n] of [...counts].sort((a, b) => b[1] - a[1])) {
       const o = document.createElement("option");
       o.value = v;
-      o.textContent = `${v} (${n})`;
+      o.textContent = `${v} (${n.toLocaleString()})`;
       select.append(o);
     }
   }
@@ -143,28 +167,38 @@
     return String(s || "").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
   }
 
-  function left(due, now) {
-    if (due == null) return { text: "기한 없음", cls: "" };
-    const min = Math.floor((due - now) / 60000);
-    if (min <= 0) return null;
+  function left(x, now) {
+    if (x.src === "own") return { text: "-", cls: "" };
+    if (x.due == null) return { text: "기한 없음", cls: "" };
+    const min = Math.floor((x.due - now) / 60000);
+    if (min <= 0) return { text: "마감", cls: "soon" };
     const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60;
     const text = d ? `${d}일 ${h}시간` : h ? `${h}시간 ${m}분` : `${m}분`;
     return { text, cls: min < 1440 ? "soon" : "" };
   }
 
+  function costText(x) {
+    if (x.src === "own") return "0";
+    if (x.cost == null) return "?";
+    return x.cost === 0 ? "무료" : `${x.cost.toLocaleString()}${UNIT[x.src] || ""}`;
+  }
+
   function render() {
     const now = Date.now();
     const words = $("q").value.split(/\s+/).map(norm).filter(Boolean);
+    const src = $("src").value;
     const board = $("board").value;
     const status = $("status").value;
     view = items.filter((x) =>
-      (x.due == null || x.due > now) &&
+      (x.src === "own" || x.due == null || x.due > now) &&
+      (!src || x.src === src) &&
       (!board || x.board === board) &&
-      (!status || (x.status || "모름") === status) &&
+      (!status || x.status === status) &&
       words.every((w) => x.key.includes(w)));
     const sort = $("sort").value;
+    if (sort === "name") view.sort((a, b) => a.name.localeCompare(b.name, "ko"));
     if (sort === "cheap") view.sort((a, b) => (a.cost ?? Infinity) - (b.cost ?? Infinity));
-    if (sort === "soon") view.sort((a, b) => (a.due ?? Infinity) - (b.due ?? Infinity));
+    if (sort === "soon") view.sort((a, b) => (a.src === "own") - (b.src === "own") || (a.due ?? Infinity) - (b.due ?? Infinity));
     $("rows").replaceChildren();
     shown = 0;
     more(now);
@@ -174,13 +208,12 @@
     const frag = document.createDocumentFragment();
     for (const x of view.slice(shown, shown + PAGE)) {
       const tr = document.createElement("tr");
-      const l = left(x.due, now) || { text: "마감", cls: "soon" };
-      const cost = x.cost == null ? "?" : x.cost === 0 ? "무료" : `${x.cost.toLocaleString()}P`;
+      const l = left(x, now);
       tr.append(
-        cell(x.title, "title"),
+        cell(x.name, "title"),
         cell(x.board, "meta nowrap"),
-        cell(x.status || "모름", "meta nowrap" + (x.status === "완결" ? " done" : "")),
-        cell(cost, "meta num" + (x.cost === 0 ? " free" : "")),
+        cell(x.status, "meta nowrap" + (x.status === "완결" ? " done" : "")),
+        cell(costText(x), "meta num" + (x.src === "own" || x.cost === 0 ? " free" : "")),
         cell(l.text, "meta num " + l.cls));
       frag.append(tr);
     }
@@ -199,7 +232,7 @@
 
   let timer = 0;
   $("q").addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(render, 120); });
-  for (const id of ["board", "status", "sort"]) $(id).addEventListener("change", render);
+  for (const id of ["src", "board", "status", "sort"]) $(id).addEventListener("change", render);
   $("more").addEventListener("click", () => more());
   $("logout").addEventListener("click", () => { store.del(keyName()); location.reload(); });
 
@@ -247,9 +280,15 @@
 
   (async () => {
     try {
-      const res = await fetch(DATA_URL, { cache: "no-cache" });
+      const res = await fetch(INDEX_URL, { cache: "no-cache" });
       if (!res.ok) throw new Error(res.status);
       envelope = await res.json();
+      // 조각은 이름이 바뀌지 않으므로 캐시를 그대로 써도 된다
+      sealed = Promise.all(envelope.chunks.map((c) => fetch(c.file).then((r) => {
+        if (!r.ok) throw new Error(r.status);
+        return r.json();
+      })));
+      await sealed;
     } catch (e) {
       document.body.textContent = "목록을 불러오지 못했어요";
       return;
