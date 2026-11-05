@@ -203,21 +203,46 @@
   $("more").addEventListener("click", () => more());
   $("logout").addEventListener("click", () => { store.del(keyName()); location.reload(); });
 
-  $("lock").addEventListener("submit", async (e) => {
-    e.preventDefault();
+  async function unlock(pw, remember) {
     $("err").textContent = "푸는 중…";
     try {
-      const key = await deriveKey($("pw").value);
+      const key = await deriveKey(pw);
       const data = await decrypt(key);
-      if ($("remember").checked) {
+      if (remember) {
         const raw = new Uint8Array(await crypto.subtle.exportKey("raw", key));
         store.set(keyName(), btoa(String.fromCharCode(...raw)));
       }
       $("err").textContent = "";
       await open(data);
+      return true;
     } catch {
       $("err").textContent = "비밀번호가 맞지 않아요";
+      return false;
     }
+  }
+
+  $("lock").addEventListener("submit", (e) => {
+    e.preventDefault();
+    unlock($("pw").value, $("remember").checked);
+  });
+
+  // `#pw=…`(권장 — 서버로 가지 않는다) 또는 `?pw=…` 로 열면 바로 푼다. 주소창에서는 곧바로 지운다
+  function takeLinkPassword() {
+    const hash = new URLSearchParams(location.hash.slice(1));
+    const query = new URLSearchParams(location.search);
+    const pw = hash.get("pw") || query.get("pw");
+    if (!pw) return "";
+    hash.delete("pw");
+    query.delete("pw");
+    const q = query.toString(), h = hash.toString();
+    history.replaceState(null, "", location.pathname + (q ? "?" + q : "") + (h ? "#" + h : ""));
+    return pw;
+  }
+
+  // 이미 열린 페이지에서 주소 뒤 `#pw=…` 만 바꾸면 다시 읽지 않으므로 여기서 받는다
+  addEventListener("hashchange", async () => {
+    const pw = envelope && takeLinkPassword();
+    if (pw && await unlock(pw, true)) location.reload();
   });
 
   (async () => {
@@ -228,6 +253,11 @@
     } catch (e) {
       document.body.textContent = "목록을 불러오지 못했어요";
       return;
+    }
+    const linkPw = takeLinkPassword();
+    if (linkPw) {
+      $("lock").hidden = false;
+      if (await unlock(linkPw, true)) return;
     }
     const saved = store.get(keyName());
     if (saved) {
