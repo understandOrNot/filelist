@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>목록</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #1d1d1f; --muted: #6e6e73; --line: #e3e3e6; --card: #fff;
+    --accent: #2563eb; --warn: #c2410c; --ok: #15803d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #141416; --fg: #ececf0; --muted: #9a9aa2; --line: #2c2c31; --card: #1c1c20;
+      --accent: #6ea0ff; --warn: #fb923c; --ok: #4ade80; }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif; }
+  main { max-width: 1000px; margin: 0 auto; padding: 20px 16px 60px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  input, select, button { font: inherit; color: inherit; background: var(--card);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  #lock { max-width: 360px; margin: 18vh auto 0; display: grid; gap: 10px; }
+  #lock label { display: flex; gap: 6px; align-items: center; color: var(--muted); font-size: 13px; }
+  #lock .err { color: var(--warn); font-size: 13px; min-height: 1.5em; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .bar #q { flex: 1 1 260px; min-width: 0; }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  th, td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; white-space: nowrap; }
+  td.num, th.num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  td.nowrap { white-space: nowrap; }
+  td.title { word-break: break-all; }
+  .soon { color: var(--warn); }
+  .done { color: var(--ok); }
+  .free { color: var(--ok); font-weight: 600; }
+  #more { display: block; margin: 12px auto 0; }
+  @media (max-width: 640px) {
+    thead { display: none; }
+    table, tbody, tr, td { display: block; width: 100%; }
+    tr { border-bottom: 1px solid var(--line); padding: 8px 10px; }
+    td { border: 0; padding: 0; text-align: left !important; }
+    td.title { font-weight: 600; margin-bottom: 2px; }
+    td.meta { display: inline; color: var(--muted); font-size: 13px; margin-right: 10px; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <form id="lock" hidden>
+    <h1>목록</h1>
+    <input id="pw" type="password" placeholder="비밀번호" autocomplete="current-password" autofocus>
+    <label><input id="remember" type="checkbox" checked> 이 브라우저에서 기억</label>
+    <button class="primary" type="submit">열기</button>
+    <div class="err" id="err"></div>
+  </form>
+
+  <section id="app" hidden>
+    <h1>받을 수 있는 파일</h1>
+    <div class="sub" id="sub"></div>
+    <div class="bar">
+      <input id="q" type="search" placeholder="제목 검색 (띄어 쓴 낱말은 모두 들어간 것)">
+      <select id="board"><option value="">분류 전체</option></select>
+      <select id="status"><option value="">완결 여부 전체</option></select>
+      <select id="sort">
+        <option value="new">최신순</option>
+        <option value="cheap">포인트 낮은 순</option>
+        <option value="soon">마감 가까운 순</option>
+      </select>
+      <button id="logout" type="button" title="기억한 비밀번호를 지운다">잠그기</button>
+    </div>
+    <table>
+      <thead><tr><th>제목</th><th>분류</th><th>완결</th><th class="num">포인트</th><th class="num">남은 시간</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <button id="more" type="button" hidden>더 보기</button>
+  </section>
+</main>
+<script>
+(() => {
+  const DATA_URL = "list.enc.json";
+  const PAGE = 300;
+  const $ = (id) => document.getElementById(id);
+  const b64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+    del(k) { try { localStorage.removeItem(k); } catch {} },
+  };
+
+  let envelope = null;
+  let items = [];
+  let shown = 0;
+  let view = [];
+
+  async function deriveKey(pw) {
+    const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(pw), "PBKDF2", false, ["deriveKey"]);
+    return crypto.subtle.deriveKey(
+      { name: "PBKDF2", hash: "SHA-256", salt: b64(envelope.salt), iterations: envelope.iter },
+      base, { name: "AES-GCM", length: 256 }, true, ["decrypt"]);
+  }
+
+  async function decrypt(key) {
+    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64(envelope.iv) }, key, b64(envelope.ct));
+    const stream = new Blob([plain]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return JSON.parse(await new Response(stream).text());
+  }
+
+  const keyName = () => "filelist-key:" + envelope.salt;
+
+  async function open(data) {
+    const f = data.fields;
+    const at = (name) => f.indexOf(name);
+    const [ti, bi, si, ci, di] = ["title", "board", "status", "cost", "due"].map(at);
+    items = data.rows.map((r) => ({ title: r[ti], board: r[bi], status: r[si], cost: r[ci], due: r[di], key: norm(r[ti]) }));
+    $("sub").textContent = `${new Date(data.updated).toLocaleString("ko-KR")} 기준 · ${items.length.toLocaleString()}건`;
+    fill($("board"), items.map((x) => x.board));
+    fill($("status"), items.map((x) => x.status || "모름"));
+    $("lock").hidden = true;
+    $("app").hidden = false;
+    render();
+    $("q").focus();
+  }
+
+  function fill(select, values) {
+    const counts = new Map();
+    for (const v of values) counts.set(v, (counts.get(v) || 0) + 1);
+    for (const [v, n] of [...counts].sort((a, b) => b[1] - a[1])) {
+      const o = document.createElement("option");
+      o.value = v;
+      o.textContent = `${v} (${n})`;
+      select.append(o);
+    }
+  }
+
+  // 띄어쓰기·문장부호를 빼고 소문자로 — `괴담마켓` 으로도 `괴담 마켓` 을 찾는다
+  function norm(s) {
+    return String(s || "").toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, "");
+  }
+
+  function left(due, now) {
+    if (due == null) return { text: "기한 없음", cls: "" };
+    const min = Math.floor((due - now) / 60000);
+    if (min <= 0) return null;
+    const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60;
+    const text = d ? `${d}일 ${h}시간` : h ? `${h}시간 ${m}분` : `${m}분`;
+    return { text, cls: min < 1440 ? "soon" : "" };
+  }
+
+  function render() {
+    const now = Date.now();
+    const words = $("q").value.split(/\s+/).map(norm).filter(Boolean);
+    const board = $("board").value;
+    const status = $("status").value;
+    view = items.filter((x) =>
+      (x.due == null || x.due > now) &&
+      (!board || x.board === board) &&
+      (!status || (x.status || "모름") === status) &&
+      words.every((w) => x.key.includes(w)));
+    const sort = $("sort").value;
+    if (sort === "cheap") view.sort((a, b) => (a.cost ?? Infinity) - (b.cost ?? Infinity));
+    if (sort === "soon") view.sort((a, b) => (a.due ?? Infinity) - (b.due ?? Infinity));
+    $("rows").replaceChildren();
+    shown = 0;
+    more(now);
+  }
+
+  function more(now = Date.now()) {
+    const frag = document.createDocumentFragment();
+    for (const x of view.slice(shown, shown + PAGE)) {
+      const tr = document.createElement("tr");
+      const l = left(x.due, now) || { text: "마감", cls: "soon" };
+      const cost = x.cost == null ? "?" : x.cost === 0 ? "무료" : `${x.cost.toLocaleString()}P`;
+      tr.append(
+        cell(x.title, "title"),
+        cell(x.board, "meta nowrap"),
+        cell(x.status || "모름", "meta nowrap" + (x.status === "완결" ? " done" : "")),
+        cell(cost, "meta num" + (x.cost === 0 ? " free" : "")),
+        cell(l.text, "meta num " + l.cls));
+      frag.append(tr);
+    }
+    shown += PAGE;
+    $("rows").append(frag);
+    $("more").hidden = shown >= view.length;
+    $("more").textContent = `더 보기 (${(view.length - Math.min(shown, view.length)).toLocaleString()}건 남음)`;
+  }
+
+  function cell(text, cls) {
+    const td = document.createElement("td");
+    td.className = cls;
+    td.textContent = text;
+    return td;
+  }
+
+  let timer = 0;
+  $("q").addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(render, 120); });
+  for (const id of ["board", "status", "sort"]) $(id).addEventListener("change", render);
+  $("more").addEventListener("click", () => more());
+  $("logout").addEventListener("click", () => { store.del(keyName()); location.reload(); });
+
+  $("lock").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    $("err").textContent = "푸는 중…";
+    try {
+      const key = await deriveKey($("pw").value);
+      const data = await decrypt(key);
+      if ($("remember").checked) {
+        const raw = new Uint8Array(await crypto.subtle.exportKey("raw", key));
+        store.set(keyName(), btoa(String.fromCharCode(...raw)));
+      }
+      $("err").textContent = "";
+      await open(data);
+    } catch {
+      $("err").textContent = "비밀번호가 맞지 않아요";
+    }
+  });
+
+  (async () => {
+    try {
+      const res = await fetch(DATA_URL, { cache: "no-cache" });
+      if (!res.ok) throw new Error(res.status);
+      envelope = await res.json();
+    } catch (e) {
+      document.body.textContent = "목록을 불러오지 못했어요";
+      return;
+    }
+    const saved = store.get(keyName());
+    if (saved) {
+      try {
+        const key = await crypto.subtle.importKey("raw", b64(saved), "AES-GCM", false, ["decrypt"]);
+        return await open(await decrypt(key));
+      } catch {
+        store.del(keyName());
+      }
+    }
+    $("lock").hidden = false;
+    $("pw").focus();
+  })();
+})();
+</script>
+</body>
+</html>
